@@ -1,54 +1,138 @@
-## 🎯 Objectif
+# 🧾 README - Infrastructure SFTP avec partage de données centralisé
 
-Configurer un **serveur SFTP sécurisé**, où chaque utilisateur a un environnement chrooté (`/sftp/USER/home`) et accède à **des partages centralisés** (via `bind mount`) stockés sur un **disque dédié de 1To**.
+## 📌 Objectif
 
----
+Mettre en place un serveur SFTP sécurisé avec :
 
-## 🧩 Architecture
-
-+-----------------------------+
-| Disque partagé SFTP |
-| /mnt/sftp_data/shared_data|
-+-------------+---------------+
-|
-| --bind
-v
-/sftp/<utilisateur>/home/<partage>
-
-yaml
-Toujours afficher les détails
-
-Copier
+- 🔒 utilisateurs chrootés  
+- 📁 accès à des dossiers partagés individuels ou communs  
+- 💾 stockage des données sur un disque de **1 To**  
+- ♻️ restauration automatisée des données depuis un ancien serveur FileZilla  
 
 ---
 
-## 🗂️ Arborescence principale
+## 🔧 Structure de l’infra
 
-- `/sftp/` : chroot des utilisateurs
-- `/mnt/sftp_data/shared_data/` : **lieu centralisé de stockage**
-- `/mnt/ftp_win/` : monté temporairement en CIFS, contient les anciennes données (via `//IP/FTP_SHARE`)
-- `output_utilisateurs.csv` : mapping `utilisateur;partage;droit (r|rw)`
-
----
-
-## ✅ Étapes automatiques (avec scripts)
-
-> Ces scripts sont fournis dans le dossier `~/py_sftp` :
-
-| Ordre | Script                             | Rôle principal |
-|-------|------------------------------------|----------------|
-| 1     | `create_sftp_structure_from_csv.sh`| Crée les chroots utilisateur |
-| 2     | `prepare_shared_data_dirs.sh`      | Crée les dossiers dans `/mnt/sftp_data` |
-| 3     | `clean_mount_units_strict.sh`      | Supprime doublons de units systemd |
-| 4     | `create_bind_mounts_from_csv.sh`   | Crée les `.mount` units + bind mount |
-| 5     | `restore_sftp_data.sh`             | Copie les données depuis `/mnt/ftp_win` |
-| 6     | `apply_sftp_acl.sh`                | Applique les ACL selon le CSV |
+- **Répertoire chroot des users :** `/sftp/<user>/home`  
+- **Stockage centralisé :** `/mnt/sftp_data/shared_data/<dossier_partagé>`  
+- **Montage bind pour chaque dossier partagé** vers le chroot de l'utilisateur  
+- **Contrôle d'accès fin** via ACL (lecture seule ou lecture/écriture)  
+- **Montage réseau** pour récupération des anciennes données via `/mnt/ftp_win`  
 
 ---
 
-## 🛠️ Refaire la configuration à la main (sans script)
+## 🧩 Étapes principales (automatisées avec scripts)
 
-### 1. Créer les utilisateurs et leur chroot
+### 1. 📥 Récupérer la config de l’ancien serveur
+
+- Copier le fichier `FileZilla Server.xml`  
+- Lancer :
+
+```bash
+python3 analyze_filezilla_sftp_map.py
+```
+
+➡️ Affiche les utilisateurs et les dossiers qu’ils utilisaient  
+➡️ Permet de **construire manuellement** `output_utilisateurs.csv` :
+
+```
+utilisateur;dossier_partage;droit
+egx;egx;rw
+fkc;validated_drawings;r
+...
+```
+
+---
+
+### 2. 🧪 Vérification du disque de données
+
+```bash
+df -h /mnt/sftp_data
+```
+
+➡️ Doit montrer un disque de ~1 To monté sur `/mnt/sftp_data` (pas `/` !)
+
+---
+
+### 3. 🚀 Lancer la création des utilisateurs et répertoires
+
+```bash
+bash init_users_and_folders.sh
+```
+
+📌 Ce script :
+
+- crée tous les utilisateurs dans `/sftp/<user>`  
+- crée les répertoires partagés dans `/mnt/sftp_data/shared_data/`  
+- applique les bons propriétaires et droits  
+
+---
+
+### 4. 🔗 Créer les montages (bind) et unités systemd
+
+```bash
+bash bind_shared_folders_with_units.sh
+```
+
+📌 Ce script :
+
+- crée les **montages bind** entre `/mnt/sftp_data/shared_data/<dossier>` → `/sftp/<user>/home/<dossier>`  
+- crée automatiquement des unités `.mount` (`sftp-<user>-home-<share>.mount`)  
+- applique les **ACL** : lecture seule (`r`) ou lecture/écriture (`rw`) selon le CSV  
+
+> 🔄 Relance sécurisée : ce script nettoie automatiquement les anciens montages avant de tout reconstruire.
+
+---
+
+### 5. ♻️ Restaurer les données depuis l’ancien serveur
+
+Vérifie d’abord le montage réseau :
+
+```bash
+ls /mnt/ftp_win
+```
+
+Puis lance la synchronisation :
+
+```bash
+bash restore_sftp_data.sh
+```
+
+📌 Ce script :
+
+- lit `output_utilisateurs.csv`  
+- copie avec `rsync` les données du répertoire `/mnt/ftp_win/<partage>` vers `/mnt/sftp_data/shared_data/<partage>`  
+- applique les droits `sftpusers` + bon propriétaire  
+
+➡️ **Peut être relancé** sans casser les accès (pas de doublons, pas d’écrasement indésirable)
+
+---
+
+## 🧪 Vérifications finales
+
+```bash
+mount | grep /sftp/
+```
+
+➡️ Tous les bind mounts doivent être listés
+
+```bash
+df -h /mnt/sftp_data
+```
+
+➡️ Vérifie que les données sont bien sur le disque de 1 To (et non sur `/`)
+
+```bash
+ls -l /sftp/<user>/home/<partage>
+```
+
+➡️ Vérifie les droits, et que l'utilisateur peut lire (et écrire si `rw`)
+
+---
+
+## 🧱 Réaliser **manuellement** (équivalent sans scripts)
+
+### 1. Créer l'utilisateur
 
 ```bash
 sudo useradd -m -d /sftp/egx -s /sbin/nologin -G sftpusers egx
@@ -56,26 +140,27 @@ sudo mkdir -p /sftp/egx/home
 sudo chown root:root /sftp/egx
 sudo chmod 755 /sftp/egx
 sudo chown egx:sftpusers /sftp/egx/home
-2. Créer le dossier de données partagées
-bash
-Toujours afficher les détails
+```
 
-Copier
+### 2. Créer le dossier de données
+
+```bash
 sudo mkdir -p /mnt/sftp_data/shared_data/egx
 sudo chown root:sftpusers /mnt/sftp_data/shared_data/egx
-3. Monter en bind le dossier partagé
-bash
-Toujours afficher les détails
+```
 
-Copier
+### 3. Monter le dossier (bind)
+
+```bash
 sudo mkdir -p /sftp/egx/home/egx
 sudo mount --bind /mnt/sftp_data/shared_data/egx /sftp/egx/home/egx
-4. Créer une unité systemd (facultatif mais recommandé)
-ini
-Toujours afficher les détails
+```
 
-Copier
-# /etc/systemd/system/sftp-egx-home-egx.mount
+### 4. Créer l’unité systemd (recommandé)
+
+`/etc/systemd/system/sftp-egx-home-egx.mount` :
+
+```ini
 [Unit]
 Description=Bind mount for EGX
 After=network.target
@@ -88,40 +173,47 @@ Options=bind
 
 [Install]
 WantedBy=multi-user.target
-Puis :
+```
 
-bash
-Toujours afficher les détails
-
-Copier
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now sftp-egx-home-egx.mount
-5. Appliquer les ACL (droits d'accès)
+```
+
+### 5. Appliquer les droits (ACL)
+
 Lecture seule :
 
-bash
-Toujours afficher les détails
-
-Copier
+```bash
 sudo setfacl -Rm u:egx:rx /mnt/sftp_data/shared_data/egx
 sudo setfacl -dRm u:egx:rx /mnt/sftp_data/shared_data/egx
-Lecture / Écriture :
+```
 
-bash
-Toujours afficher les détails
+Lecture/écriture :
 
-Copier
+```bash
 sudo setfacl -Rm u:egx:rwx /mnt/sftp_data/shared_data/egx
 sudo setfacl -dRm u:egx:rwx /mnt/sftp_data/shared_data/egx
-🔁 Mise à jour des données
-Si des données sont rajoutées côté ancien serveur :
-✅ Tu peux relancer restore_sftp_data.sh sans créer de doublons ni casser les accès.
+```
 
-🧪 Vérification
-mount | grep /sftp/ → vérifie que tous les mounts sont actifs
+---
 
-df -h → vérifie que /mnt/sftp_data est bien utilisé (pas /)
+## 📎 Fichiers importants du projet
 
-✅ Résultat final
-Chaque utilisateur voit uniquement ses dossiers, avec les droits définis, et les données sont sur le disque de 1To.
+| Fichier                             | Description                                                  |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `output_utilisateurs.csv`           | Liste des utilisateurs, partages et droits                   |
+| `analyze_filezilla_sftp_map.py`     | Analyse FileZilla XML et aide à remplir le CSV               |
+| `init_users_and_folders.sh`         | Crée les users + chroot + dossiers partagés                  |
+| `bind_shared_folders_with_units.sh` | Crée les montages bind + unités systemd + ACL                |
+| `restore_sftp_data.sh`              | Copie les données de l’ancien serveur dans les bons dossiers |
 
+---
+
+## ✅ Résultat final
+
+- Les utilisateurs **ne voient que leurs dossiers**  
+- Les accès sont **sécurisés et chrootés**  
+- Les données sont **stockées uniquement** sur le **disque de 1 To**  
+- L’infrastructure est **persistante au redémarrage**  
+- Et toute la mise en place peut être **entièrement automatisée** ou refaite à la main si besoin
